@@ -9,6 +9,7 @@ from .moore import MOORENetwork
 from .multi_head import MultiHeadNetwork
 from .paco import PaCoNetwork
 from .soft_modules import SoftModularizationNetwork
+from .dime import DIMENetwork
 
 
 def get_nn_arch_for_config(
@@ -26,6 +27,8 @@ def get_nn_arch_for_config(
         return FiLMNetwork
     elif type(config) is metaworld_algorithms.config.nn.MOOREConfig:
         return MOORENetwork
+    elif type(config) is metaworld_algorithms.config.nn.DIMEConfig:
+        return DIMENetwork
     elif type(config) is metaworld_algorithms.config.nn.VanillaNetworkConfig:
         return VanillaNetwork
     else:

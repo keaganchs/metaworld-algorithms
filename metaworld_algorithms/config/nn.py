@@ -2,10 +2,18 @@ from dataclasses import dataclass
 
 from .optim import OptimizerConfig
 from .utils import Activation, CellType, Initializer
+# from .networks import QValueFunctionConfig
+
+@dataclass(frozen=True)
+class NetworkConfig:
+    """Base config for neural networks."""
+    
+    optimizer: OptimizerConfig = OptimizerConfig()
+
 
 
 @dataclass(frozen=True, kw_only=True)
-class NeuralNetworkConfig:
+class NeuralNetworkConfig(NetworkConfig):
     width: int = 400
     """The number of neurons in the hidden layers."""
 
@@ -25,9 +33,6 @@ class NeuralNetworkConfig:
 
     activation: Activation = Activation.ReLU
     """The activation function to use."""
-
-    optimizer: OptimizerConfig = OptimizerConfig()
-    """The optimizer to use for the network."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -152,3 +157,32 @@ class MOOREConfig(NeuralNetworkConfig):
     num_experts: int = 4
     """The number of orthogonal experts."""
     # Original values are 4 for MT10 and 6 for MT50
+
+
+@dataclass(frozen=True, kw_only=True)
+class DIMEConfig(VanillaNetworkConfig):
+    diffusion_config: VanillaNetworkConfig = VanillaNetworkConfig()
+    """The configuration for the diffusion network, which is used to generate task-specific policies."""
+
+    temperature_optimizer_config: OptimizerConfig = OptimizerConfig(max_grad_norm=None)
+    """The configuration for the temperature optimizer, which is used to adjust the exploration-exploitation trade-off."""
+
+    initial_temperature: float = 1.0
+    """The initial temperature controls the exploration-exploitation trade-off."""
+
+    num_critics: int = 2
+    """The number of critics."""
+
+    tau: float = 0.005
+    """The rate at which the target network is updated."""
+
+    num_diffusion_steps: int = 16
+    """The number of diffusion steps to take during training. This controls the number of policy updates per training step.
+    16 was found to be optimal in the original DIME paper, but 8 or 4 steps can also be used for faster training and inference."""
+    
+    diffusion_schedule_steps: int = 1000
+    """The number of steps for the diffusion schedule, which controls the noise level in the diffusion process."""
+
+    ema_rate: float = 0.995
+    """The rate at which the exponential moving average of the policy is updated.
+    This is used to stabilize the training process by smoothing out the policy updates."""
