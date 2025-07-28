@@ -60,7 +60,7 @@ class DiffusionPolicy(nn.Module):
         self.alpha_bar_schedule = jnp.cumprod(self.alpha_schedule)
     
     @nn.compact
-    def __call__(self, observation: Observation, timestep: jnp.ndarray, noisy_action: Action) -> Action:
+    def __call__(self, observation: Observation, timestep: jnp.ndarray, noisy_action: Action) -> distrax.Distribution:
         """Predict noise to denoise the action."""
         # Handle both single and batched inputs
         batch_shape = observation.shape[:-1]  # Get batch dimensions
@@ -217,8 +217,8 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
         )
 
         master_key = jax.random.PRNGKey(seed)
-        actor_key, critic_key, temperature_key, algorithm_key = jax.random.split(
-            master_key, 4
+        actor_key, critic_key, temperature_key, algorithm_key = (
+            jax.random.split(master_key, 4)
         )
 
         action_dim = int(np.prod(env_config.action_space.shape))
