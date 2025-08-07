@@ -192,6 +192,7 @@ class DIMEConfig(AlgorithmConfig):
     diffusion_num_layers: int = 3
     policy_delay: int = 2
     entropy_coefficient: float = 0.1
+    logging_frequency: int = 1000  # How often to log metrics
 
 
 class DIME(OffPolicyAlgorithm[DIMEConfig]):
@@ -213,6 +214,7 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
     alpha_schedule: Array = struct.field(pytree_node=False)
     alpha_bar_schedule: Array = struct.field(pytree_node=False)
     _n_updates: int = struct.field(pytree_node=False)
+    logging_frequency: int = struct.field(pytree_node=False)
 
     @override
     @staticmethod
@@ -307,6 +309,7 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
             alpha_schedule=alpha_schedule,
             alpha_bar_schedule=alpha_bar_schedule,
             _n_updates=0,
+            logging_frequency=config.logging_frequency,
         )
 
     @override
@@ -383,9 +386,10 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
             total_loss = jnp.sum(critic_losses)
             
             logs = {
-                "critic_loss": total_loss,
-                "q_mean": jnp.mean(q_values),
-                "target_mean": jnp.mean(targets),
+                "train/critic_loss": total_loss,
+                "train/q_mean": jnp.mean(q_values),
+                "train/target_mean": jnp.mean(targets),
+                "train/temperature": temperature,
             }
             
             return total_loss, logs
@@ -430,8 +434,8 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
             actor_loss = -jnp.mean(q_value + temperature * self.entropy_coefficient)
             
             return actor_loss, {
-                "actor_loss": actor_loss,
-                "q_value_mean": jnp.mean(q_value),
+                "train/actor_loss": actor_loss,
+                "train/q_value_mean": jnp.mean(q_value),
             }
         
         def temperature_loss_fn(temperature_params):
@@ -441,7 +445,10 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
             # Use the target entropy
             temperature_loss = temperature * (self.entropy_coefficient - self.target_entropy)
             
-            return jnp.mean(temperature_loss), {"temperature_loss": jnp.mean(temperature_loss)}
+            return jnp.mean(temperature_loss), {
+                "train/temperature_loss": jnp.mean(temperature_loss),
+                "train/temperature_value": temperature,
+            }
         
         # Update actor
         (actor_loss, actor_logs), actor_grads = jax.value_and_grad(
@@ -463,14 +470,20 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
         # Update critics
         new_critic, critic_logs = self._update_critic(batch)
         
-        logs = critic_logs
+        logs = {}
+        
+        # Only log critic metrics if we're at a logging step
+        should_log = (self._n_updates + 1) % self.logging_frequency == 0
+        if should_log:
+            logs.update(critic_logs)
         
         # Update actor and temperature (with policy delay)
         if (self._n_updates + 1) % self.policy_delay == 0:
             new_actor, new_temperature, policy_logs = self._update_actor_and_temperature(
                 new_critic, batch
             )
-            logs.update(policy_logs)
+            if should_log:
+                logs.update(policy_logs)
         else:
             new_actor = self.actor
             new_temperature = self.temperature
