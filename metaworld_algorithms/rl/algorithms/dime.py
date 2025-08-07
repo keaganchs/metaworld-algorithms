@@ -53,12 +53,6 @@ class DiffusionPolicy(nn.Module):
     num_layers: int = 3
     num_diffusion_steps: int = 16
     
-    def setup(self):
-        # Initialize diffusion schedule
-        self.beta_schedule = jnp.linspace(1e-4, 2e-2, self.num_diffusion_steps)
-        self.alpha_schedule = 1.0 - self.beta_schedule
-        self.alpha_bar_schedule = jnp.cumprod(self.alpha_schedule)
-    
     @nn.compact
     def __call__(self, observation: Observation, timestep: jnp.ndarray, noisy_action: Action) -> distrax.Distribution:
         """Predict noise to denoise the action."""
@@ -90,42 +84,6 @@ class DiffusionPolicy(nn.Module):
             x = nn.gelu(x)
         x = nn.Dense(self.action_dim)(x)
         return x
-    
-    def sample(self, observation: Observation, key: PRNGKeyArray) -> Action:
-        """Sample action using diffusion denoising process."""
-        # Handle both single and batched inputs
-        batch_shape = observation.shape[:-1]  # Get batch dimensions
-        action_shape = batch_shape + (self.action_dim,)
-        
-        # Start with pure noise
-        key, noise_key = jax.random.split(key)
-        action = jax.random.normal(noise_key, action_shape)
-        
-        # Denoise iteratively
-        for t in reversed(range(self.num_diffusion_steps)):
-            key, noise_key = jax.random.split(key)
-            
-            # Predict noise using __call__
-            predicted_noise = self(observation, t, action)
-            
-            # Denoise step (DDPM)
-            alpha_t = self.alpha_schedule[t]
-            alpha_bar_t = self.alpha_bar_schedule[t]
-            beta_t = self.beta_schedule[t]
-            
-            if t > 0:
-                noise = jax.random.normal(noise_key, action.shape)
-                sigma_t = jnp.sqrt(beta_t)
-            else:
-                noise = 0.0
-                sigma_t = 0.0
-            
-            action = (1.0 / jnp.sqrt(alpha_t)) * (
-                action - (beta_t / jnp.sqrt(1.0 - alpha_bar_t)) * predicted_noise
-            ) + sigma_t * noise
-        
-        # Apply tanh to bound actions
-        return jnp.tanh(action)
 
 
 class Temperature(nn.Module):
@@ -141,32 +99,81 @@ class Temperature(nn.Module):
         return jnp.exp(self.log_alpha)
 
 
-def make_diffusion_apply_fn(module):
-    """Create a custom apply function for diffusion sampling."""
-    def diffusion_apply_fn(params, observation, key):
-        # Bind the module with params and call sample
-        bound_module = module.bind({'params': params})
-        return bound_module.sample(observation, key)
-    return diffusion_apply_fn
+@partial(jax.jit, static_argnums=(0, 4))
+def diffusion_sample(
+    apply_fn, params, observation: Observation, key: PRNGKeyArray, 
+    action_dim: int, beta_schedule: jnp.ndarray, alpha_schedule: jnp.ndarray, alpha_bar_schedule: jnp.ndarray
+) -> Action:
+    """Sample action using diffusion denoising process."""
+    # Handle both single and batched inputs
+    batch_shape = observation.shape[:-1]  # Get batch dimensions
+    action_shape = batch_shape + (action_dim,)
+    
+    num_diffusion_steps = len(beta_schedule)
+    
+    # Start with pure noise
+    key, noise_key = jax.random.split(key)
+    action = jax.random.normal(noise_key, action_shape)
+    
+    # Use jax.fori_loop for efficient JIT compilation instead of Python for loop
+    def denoise_step(i, carry):
+        action, key = carry
+        t = num_diffusion_steps - 1 - i  # Reverse the order
+        key, noise_key = jax.random.split(key)
+        
+        # Predict noise using the network
+        predicted_noise = apply_fn(params, observation, t, action)
+        
+        # Denoise step (DDPM)
+        alpha_t = alpha_schedule[t]
+        alpha_bar_t = alpha_bar_schedule[t]
+        beta_t = beta_schedule[t]
+        
+        # Use jnp.where for conditional logic instead of if/else
+        noise = jax.random.normal(noise_key, action.shape)
+        sigma_t = jnp.sqrt(beta_t)
+        
+        # Apply noise only if t > 0
+        noise = jnp.where(t > 0, noise, 0.0)
+        sigma_t = jnp.where(t > 0, sigma_t, 0.0)
+        
+        action = (1.0 / jnp.sqrt(alpha_t)) * (
+            action - (beta_t / jnp.sqrt(1.0 - alpha_bar_t)) * predicted_noise
+        ) + sigma_t * noise
+        
+        return action, key
+    
+    action, _ = jax.lax.fori_loop(0, num_diffusion_steps, denoise_step, (action, key))
+    
+    # Apply tanh to bound actions
+    return jnp.tanh(action)
 
 
-@jax.jit
+@partial(jax.jit, static_argnums=(3,))
 def _sample_action(
-    actor: TrainState, observation: Observation, key: PRNGKeyArray
+    actor: TrainState, observation: Observation, key: PRNGKeyArray,
+    action_dim: int, beta_schedule: jnp.ndarray, alpha_schedule: jnp.ndarray, alpha_bar_schedule: jnp.ndarray
 ) -> tuple[Float[Array, "... action_dim"], PRNGKeyArray]:
     key, action_key = jax.random.split(key)
-    action = actor.apply_fn(actor.params, observation, action_key)
+    action = diffusion_sample(
+        actor.apply_fn, actor.params, observation, action_key,
+        action_dim, beta_schedule, alpha_schedule, alpha_bar_schedule
+    )
     return action, key
 
 
-@jax.jit
+@partial(jax.jit, static_argnums=(3,))
 def _eval_action(
-    actor: TrainState, observation: Observation, key: PRNGKeyArray
+    actor: TrainState, observation: Observation, key: PRNGKeyArray,
+    action_dim: int, beta_schedule: jnp.ndarray, alpha_schedule: jnp.ndarray, alpha_bar_schedule: jnp.ndarray
 ) -> Float[Array, "... action_dim"]:
     # For evaluation, average multiple samples
     keys = jax.random.split(key, 5)
     actions = jax.vmap(
-        lambda k: actor.apply_fn(actor.params, observation, k)
+        lambda k: diffusion_sample(
+            actor.apply_fn, actor.params, observation, k,
+            action_dim, beta_schedule, alpha_schedule, alpha_bar_schedule
+        )
     )(keys)
     return jnp.mean(actions, axis=0)
 
@@ -200,6 +207,11 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
     policy_delay: int = struct.field(pytree_node=False)
     entropy_coefficient: float = struct.field(pytree_node=False)
     target_entropy: float = struct.field(pytree_node=False)
+    action_dim: int = struct.field(pytree_node=False)
+    num_diffusion_steps: int = struct.field(pytree_node=False)
+    beta_schedule: Array = struct.field(pytree_node=False)
+    alpha_schedule: Array = struct.field(pytree_node=False)
+    alpha_bar_schedule: Array = struct.field(pytree_node=False)
     _n_updates: int = struct.field(pytree_node=False)
 
     @override
@@ -243,7 +255,7 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
         dummy_params = actor_net.init(actor_key, dummy_obs[0], dummy_timestep, dummy_action)
         
         actor = TrainState.create(
-            apply_fn=make_diffusion_apply_fn(actor_net),
+            apply_fn=actor_net.apply,
             params=dummy_params,
             tx=config.actor_config.network_config.optimizer.spawn(),
         )
@@ -272,6 +284,11 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
 
         target_entropy = -np.prod(env_config.action_space.shape).item()
 
+        # Initialize diffusion schedules
+        beta_schedule = jnp.linspace(1e-4, 2e-2, config.num_diffusion_steps)
+        alpha_schedule = 1.0 - beta_schedule
+        alpha_bar_schedule = jnp.cumprod(alpha_schedule)
+
         return DIME(
             actor=actor,
             critic=critic,
@@ -284,6 +301,11 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
             policy_delay=config.policy_delay,
             entropy_coefficient=config.entropy_coefficient,
             target_entropy=target_entropy,
+            action_dim=action_dim,
+            num_diffusion_steps=config.num_diffusion_steps,
+            beta_schedule=beta_schedule,
+            alpha_schedule=alpha_schedule,
+            alpha_bar_schedule=alpha_bar_schedule,
             _n_updates=0,
         )
 
@@ -313,12 +335,18 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
 
     @override
     def sample_action(self, observation: Observation) -> tuple[Self, Action]:
-        action, key = _sample_action(self.actor, observation, self.key)
+        action, key = _sample_action(
+            self.actor, observation, self.key, self.action_dim, 
+            self.beta_schedule, self.alpha_schedule, self.alpha_bar_schedule
+        )
         return self.replace(key=key), jax.device_get(action)
 
     @override
     def eval_action(self, observation: Observation) -> Action:
-        return jax.device_get(_eval_action(self.actor, observation, self.key))
+        return jax.device_get(_eval_action(
+            self.actor, observation, self.key, self.action_dim,
+            self.beta_schedule, self.alpha_schedule, self.alpha_bar_schedule
+        ))
 
     def _update_critic(self, batch: ReplayBufferSamples) -> tuple[CriticTrainState, LogDict]:
         """Update critic networks."""
@@ -330,8 +358,9 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
             
             # Target Q-values using target parameters
             key, action_key = jax.random.split(self.key)
-            next_actions = self.actor.apply_fn(
-                self.actor.params, batch.next_observations, action_key
+            next_actions = diffusion_sample(
+                self.actor.apply_fn, self.actor.params, batch.next_observations, action_key,
+                self.action_dim, self.beta_schedule, self.alpha_schedule, self.alpha_bar_schedule
             )
             
             target_q_values = self.critic.apply_fn(
@@ -367,7 +396,7 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
         new_critic = self.critic.apply_gradients(grads=grads)
         
         # Soft update target parameters
-        new_target_params = jax.tree_map(
+        new_target_params = jax.tree.map(
             lambda target, online: self.tau * online + (1 - self.tau) * target,
             new_critic.target_params,
             new_critic.params,
@@ -383,8 +412,9 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
         def actor_loss_fn(actor_params):
             # Sample actions from diffusion policy
             key, action_key = jax.random.split(self.key)
-            actions = self.actor.apply_fn(
-                actor_params, batch.observations, action_key
+            actions = diffusion_sample(
+                self.actor.apply_fn, actor_params, batch.observations, action_key,
+                self.action_dim, self.beta_schedule, self.alpha_schedule, self.alpha_bar_schedule
             )
             
             # Q-values for these actions
@@ -428,7 +458,6 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
         logs = {**actor_logs, **temp_logs}
         return new_actor, new_temperature, logs
 
-    @jax.jit
     def _update_inner(self, batch: ReplayBufferSamples) -> tuple[Self, LogDict]:
         """Update the DIME algorithm."""
         # Update critics
