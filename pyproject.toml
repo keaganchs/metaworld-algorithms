@@ -15,10 +15,11 @@ dependencies = [
     "tyro>=0.8.11",
     "wandb<=0.19.9",
     "scipy>=1.15.2",
+    "tfp-nightly==0.26.0.dev20250807"
 ]
 
 [project.optional-dependencies]
-cpu = ["jax=0.7.0"]
+cpu = ["jax==0.7.0"]
 # https://github.com/jax-ml/jax/issues/27062
 metal = ["jax<=0.7.0", "jax-metal>=0.1.0; sys_platform == 'darwin'"]
 cuda12 = ["jax[cuda12]==0.7.0"]
