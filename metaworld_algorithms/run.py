@@ -60,8 +60,11 @@ class Run:
         return self.data_dir / f"{self.run_name}_{self.seed}"
 
     def _get_latest_checkpoint_metadata(self) -> CheckpointMetadata | None:
+        checkpoint_dir = pathlib.Path(self._get_data_dir() / "checkpoints").absolute()
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
         checkpoint_manager = ocp.CheckpointManager(
-            pathlib.Path(self._get_data_dir() / "checkpoints").absolute(),
+            checkpoint_dir,
             item_names=("metadata",),
             options=ocp.CheckpointManagerOptions(
                 max_to_keep=self.max_checkpoints_to_keep,
@@ -130,8 +133,12 @@ class Run:
             if is_off_policy:
                 checkpoint_items += ("buffer",)
 
+            # Ensure checkpoint directory exists before creating CheckpointManager
+            checkpoint_dir = pathlib.Path(self._get_data_dir() / "checkpoints").absolute()
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
             checkpoint_manager = ocp.CheckpointManager(
-                pathlib.Path(self._get_data_dir() / "checkpoints").absolute(),
+                checkpoint_dir,
                 item_names=checkpoint_items,
                 options=ocp.CheckpointManagerOptions(
                     max_to_keep=self.max_checkpoints_to_keep,
@@ -190,19 +197,10 @@ class Run:
 
         # Cleanup
         if self.checkpoint:
-            if isinstance(
-                agent, (OnPolicyAlgorithm, OffPolicyAlgorithm)
-            ) and not isinstance(self.env, MetaLearningEnvConfig):
-                mean_success_rate, mean_returns, mean_success_per_task = (
-                    self.env.evaluate(envs, agent)
-                )
-
-            envs.close()
-            del envs
-
             if isinstance(agent, MetaLearningAlgorithm) and isinstance(
                 self.env, MetaLearningEnvConfig
             ):
+                # Handle meta-learning algorithms
                 gc.collect()
                 eval_envs = self.env.spawn_test(self.seed)
                 mean_success_rate, mean_returns, mean_success_per_task = (
@@ -210,8 +208,19 @@ class Run:
                 )
                 eval_envs.close()
                 del eval_envs
+            elif isinstance(
+                agent, (OnPolicyAlgorithm, OffPolicyAlgorithm)
+            ) and not isinstance(self.env, MetaLearningEnvConfig):
+                # Handle regular algorithms (like DIME)
+                mean_success_rate, mean_returns, mean_success_per_task = (
+                    self.env.evaluate(envs, agent)
+                )
             else:
                 raise ValueError("Invalid agent / env combination.")
+
+            envs.close()
+            del envs
+
             final_metrics = {
                 "charts/mean_success_rate": float(mean_success_rate),
                 "charts/mean_evaluation_return": float(mean_returns),
