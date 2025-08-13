@@ -112,9 +112,15 @@ def diffusion_sample(
     key, noise_key = jax.random.split(key)
     action = jax.random.normal(noise_key, action_shape)
     
-    # Pre-compute common values
+    # Pre-compute all values for efficiency
     sqrt_one_minus_alpha_bar = jnp.sqrt(1.0 - alpha_bar_schedule)
     sqrt_alpha_bar = jnp.sqrt(alpha_bar_schedule)
+    sqrt_alpha = jnp.sqrt(alpha_schedule)
+    
+    # Pre-compute posterior variance for all steps
+    alpha_bar_prev = jnp.concatenate([jnp.array([1.0]), alpha_bar_schedule[:-1]])
+    posterior_var = beta_schedule * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_schedule)
+    sqrt_posterior_var = jnp.sqrt(posterior_var)
     
     def single_step(i, carry_state):
         action, rng_key = carry_state
@@ -123,25 +129,20 @@ def diffusion_sample(
         # Predict noise
         predicted_noise = apply_fn(params, observation, t, action)
         
-        # Denoise
+        # Denoise using optimized formula
         action = (action - sqrt_one_minus_alpha_bar[t] * predicted_noise) / sqrt_alpha_bar[t]
         
-        # Add noise (except last step)
+        # Add noise (except last step) - optimized conditional
         rng_key, step_key = jax.random.split(rng_key)
         noise = jax.random.normal(step_key, action_shape)
         
-        # Posterior variance for DDPM
-        beta_t = beta_schedule[t]
-        alpha_bar_prev = jnp.where(t > 0, alpha_bar_schedule[t-1], 1.0)
-        posterior_var = beta_t * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_schedule[t])
-        
-        # Only add noise if not the final step
-        noise_scale = jnp.where(t > 0, jnp.sqrt(posterior_var), 0.0)
+        # Use pre-computed values and efficient conditional
+        noise_scale = jnp.where(t > 0, sqrt_posterior_var[t], 0.0)
         action = action + noise_scale * noise
         
         return action, rng_key
     
-    # Use fori_loop but with minimal state
+    # Use fori_loop with minimal state
     final_action, _ = jax.lax.fori_loop(0, num_steps, single_step, (action, key))
     
     return jnp.tanh(final_action)
@@ -165,15 +166,13 @@ def _eval_action(
     actor: TrainState, observation: Observation, key: PRNGKeyArray,
     action_dim: int, beta_schedule: jnp.ndarray, alpha_schedule: jnp.ndarray, alpha_bar_schedule: jnp.ndarray
 ) -> Float[Array, "... action_dim"]:
-    # For evaluation, average multiple samples - use fewer samples to reduce computation
-    keys = jax.random.split(key, 3)  # Reduced from 5 to 3 samples
-    actions = jax.vmap(
-        lambda k: diffusion_sample(
-            actor.apply_fn, actor.params, observation, k,
-            action_dim, beta_schedule, alpha_schedule, alpha_bar_schedule
-        )
-    )(keys)
-    return jnp.mean(actions, axis=0)
+    # For evaluation, use a single sample instead of averaging multiple samples
+    # This significantly reduces computation cost
+    action = diffusion_sample(
+        actor.apply_fn, actor.params, observation, key,
+        action_dim, beta_schedule, alpha_schedule, alpha_bar_schedule
+    )
+    return action
 
 
 @dataclasses.dataclass(frozen=True)
@@ -411,6 +410,61 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
         return new_critic, logs
 
     @jax.jit
+    def _update_critic_with_actions(self, batch: ReplayBufferSamples, key: PRNGKeyArray, next_actions: Action) -> tuple[CriticTrainState, LogDict]:
+        """Update critic networks using pre-sampled actions for efficiency."""
+        def critic_loss_fn(critic_params):
+            # Current Q-values
+            q_values = self.critic.apply_fn(
+                critic_params, batch.observations, batch.actions
+            )
+            
+            # Target Q-values using target parameters - cache temperature
+            temperature = jax.lax.stop_gradient(self.temperature.apply_fn(self.temperature.params))
+            
+            # Use pre-sampled next actions (major optimization)
+            target_q_values = self.critic.apply_fn(
+                self.critic.target_params, batch.next_observations, next_actions
+            )
+            target_q = jnp.min(target_q_values, axis=0)
+            
+            # Compute targets with entropy bonus
+            entropy_bonus = temperature * self.entropy_coefficient
+            targets = batch.rewards + self.gamma * (1 - batch.dones) * (
+                target_q + entropy_bonus
+            )
+            targets = jax.lax.stop_gradient(targets)
+            
+            # Critic loss - use more stable loss computation
+            critic_losses = (q_values - targets[None, :]) ** 2
+            total_loss = jnp.mean(critic_losses)
+            
+            logs = {
+                "train/critic_loss": total_loss,
+                "train/critic_q_mean": jnp.mean(q_values),
+                "train/critic_target_mean": jnp.mean(targets),
+                "train/temperature": temperature,
+            }
+            
+            return total_loss, logs
+        
+        (loss, logs), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(
+            self.critic.params
+        )
+        
+        # Apply gradients
+        new_critic = self.critic.apply_gradients(grads=grads)
+        
+        # Soft update target parameters with explicit tree_map to avoid memory accumulation
+        new_target_params = jax.tree.map(
+            lambda target, online: self.tau * online + (1 - self.tau) * target,
+            new_critic.target_params,
+            new_critic.params,
+        )
+        new_critic = new_critic.replace(target_params=new_target_params)
+        
+        return new_critic, logs
+
+    @jax.jit
     def _update_actor_and_temperature(
         self, critic: CriticTrainState, batch: ReplayBufferSamples, key: PRNGKeyArray
     ) -> tuple[TrainState, TrainState, LogDict]:
@@ -466,13 +520,72 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
         logs = {**actor_logs, **temp_logs}
         return new_actor, new_temperature, logs
 
+    @jax.jit
+    def _update_actor_and_temperature_with_actions(
+        self, critic: CriticTrainState, batch: ReplayBufferSamples, key: PRNGKeyArray, actions: Action
+    ) -> tuple[TrainState, TrainState, LogDict]:
+        """Update actor (diffusion policy) and temperature using pre-sampled actions for efficiency."""
+        def actor_loss_fn(actor_params):
+            # Use pre-sampled actions (major optimization - no additional diffusion sampling)
+            
+            # Q-values for these actions
+            q_values = critic.apply_fn(
+                critic.params, batch.observations, actions
+            )
+            q_value = jnp.min(q_values, axis=0)
+            
+            # Temperature
+            temperature = self.temperature.apply_fn(self.temperature.params)
+            
+            # Actor loss (maximize Q-value + entropy)
+            actor_loss = -jnp.mean(q_value + temperature * self.entropy_coefficient)
+            
+            return actor_loss, {
+                "train/actor_loss": actor_loss,
+                "train/q_value_mean": jnp.mean(q_value),
+            }
+        
+        def temperature_loss_fn(temperature_params):
+            # Temperature loss (entropy regularization)
+            temperature = self.temperature.apply_fn(temperature_params)
+            
+            # Use the target entropy
+            temperature_loss = temperature * (self.entropy_coefficient - self.target_entropy)
+            
+            return jnp.mean(temperature_loss), {
+                # "train/temperature_loss": jnp.mean(temperature_loss),
+                "train/temperature": temperature,
+            }
+        
+        # Update actor
+        (actor_loss, actor_logs), actor_grads = jax.value_and_grad(
+            actor_loss_fn, has_aux=True
+        )(self.actor.params)
+        new_actor = self.actor.apply_gradients(grads=actor_grads)
+        
+        # Update temperature
+        (temp_loss, temp_logs), temp_grads = jax.value_and_grad(
+            temperature_loss_fn, has_aux=True
+        )(self.temperature.params)
+        new_temperature = self.temperature.apply_gradients(grads=temp_grads)
+        
+        logs = {**actor_logs, **temp_logs}
+        return new_actor, new_temperature, logs
+
     def _update_inner(self, batch: ReplayBufferSamples) -> tuple[Self, LogDict]:
         """Update the DIME algorithm."""
         # Split keys for proper randomness in each update
-        key1, key2, new_key = jax.random.split(self.key, 3)
+        key1, key2, key3, new_key = jax.random.split(self.key, 4)
         
-        # Update critics
-        new_critic, critic_logs = self._update_critic(batch, key1)
+        # Sample actions once and reuse for both critic and actor updates to save computation
+        # This is the major optimization - avoids redundant diffusion sampling
+        sampled_actions = diffusion_sample(
+            self.actor.apply_fn, self.actor.params, batch.observations, key3,
+            self.action_dim, self.beta_schedule, self.alpha_schedule, self.alpha_bar_schedule
+        )
+        
+        # Update critics with pre-sampled actions
+        new_critic, critic_logs = self._update_critic_with_actions(batch, key1, sampled_actions)
         
         logs = {}
         
@@ -483,8 +596,8 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
         
         # Update actor and temperature (with policy delay)
         if (self._n_updates + 1) % self.policy_delay == 0:
-            new_actor, new_temperature, policy_logs = self._update_actor_and_temperature(
-                new_critic, batch, key2
+            new_actor, new_temperature, policy_logs = self._update_actor_and_temperature_with_actions(
+                new_critic, batch, key2, sampled_actions
             )
             if should_log:
                 logs.update(policy_logs)
