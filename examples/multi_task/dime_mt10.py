@@ -54,7 +54,7 @@ def main() -> None:
             initial_temperature=1.0,
             tau=0.005,
             policy_tau=0.005,
-            num_diffusion_steps=16,
+            num_diffusion_steps=4,  # Reduced for faster testing from 16
             diffusion_hidden_dim=256,
             diffusion_num_layers=3,
             policy_delay=2,
@@ -63,7 +63,7 @@ def main() -> None:
         training_config=OffPolicyTrainingConfig(
             total_steps=int(2e7),
             buffer_size=int(1e6),
-            batch_size=1280,
+            batch_size=640, # Reduced for faster testing from 1280
         ),
         checkpoint=True,
         resume=args.resume,

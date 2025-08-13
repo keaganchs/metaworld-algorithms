@@ -54,36 +54,35 @@ class DiffusionPolicy(nn.Module):
     num_diffusion_steps: int = 16
     
     @nn.compact
-    def __call__(self, observation: Observation, timestep: jnp.ndarray, noisy_action: Action) -> distrax.Distribution:
+    def __call__(self, observation: Observation, timestep: jnp.ndarray, noisy_action: Action) -> Action:
         """Predict noise to denoise the action."""
-        # Handle both single and batched inputs
-        batch_shape = observation.shape[:-1]  # Get batch dimensions
+        # Get batch dimensions - works for both batched and unbatched inputs
+        batch_shape = observation.shape[:-1]
         
-        # Simple timestep embedding - broadcast to match batch shape
+        # Create timestep embedding with proper broadcasting
+        # Use jnp.broadcast_to which is JIT-friendly when target shape is known
         timestep_embed = jnp.sin(timestep * jnp.array([1.0, 2.0, 4.0, 8.0]))
-        if batch_shape:
-            # Expand timestep_embed to match batch dimensions
-            timestep_embed = jnp.broadcast_to(
-                timestep_embed, batch_shape + timestep_embed.shape
-            )
         
-        # Ensure noisy_action matches batch shape
-        if batch_shape and noisy_action.shape != observation.shape[:-1] + (self.action_dim,):
-            # If action is not batched but observation is, broadcast it
-            noisy_action = jnp.broadcast_to(
-                noisy_action, batch_shape + (self.action_dim,)
-            )
+        # Always broadcast to match observation batch shape + embedding dim
+        target_embed_shape = batch_shape + (4,)  # 4 is the embedding dimension
+        timestep_embed = jnp.broadcast_to(timestep_embed, target_embed_shape)
         
-        # Concatenate inputs
+        # Ensure noisy_action has the correct shape by broadcasting
+        target_action_shape = batch_shape + (self.action_dim,)
+        noisy_action = jnp.broadcast_to(noisy_action, target_action_shape)
+        
+        # Concatenate inputs - all shapes are now guaranteed to be compatible
         inputs = jnp.concatenate([observation, timestep_embed, noisy_action], axis=-1)
         
-        # Create the noise prediction network with @nn.compact
+        # Forward pass through the network
         x = inputs
         for _ in range(self.num_layers):
             x = nn.Dense(self.hidden_dim)(x)
             x = nn.gelu(x)
-        x = nn.Dense(self.action_dim)(x)
-        return x
+        
+        # Final output layer
+        noise_prediction = nn.Dense(self.action_dim)(x)
+        return noise_prediction
 
 
 class Temperature(nn.Module):
@@ -104,53 +103,48 @@ def diffusion_sample(
     apply_fn, params, observation: Observation, key: PRNGKeyArray, 
     action_dim: int, beta_schedule: jnp.ndarray, alpha_schedule: jnp.ndarray, alpha_bar_schedule: jnp.ndarray
 ) -> Action:
-    """Sample action using diffusion denoising process."""
-    # Handle both single and batched inputs
-    batch_shape = observation.shape[:-1]  # Get batch dimensions
+    """Efficient DDPM sampling with minimal overhead."""
+    batch_shape = observation.shape[:-1]
     action_shape = batch_shape + (action_dim,)
-    
-    num_diffusion_steps = len(beta_schedule)
-    
-    # Pre-split all keys at once to avoid repeated key operations in loop
-    keys = jax.random.split(key, num_diffusion_steps + 1)
+    num_steps = len(beta_schedule)
     
     # Start with pure noise
-    action = jax.random.normal(keys[0], action_shape)
+    key, noise_key = jax.random.split(key)
+    action = jax.random.normal(noise_key, action_shape)
     
-    # Use jax.fori_loop for efficient JIT compilation
-    def denoise_step(i, action_state):
-        action = action_state
-        t = num_diffusion_steps - 1 - i  # Reverse the order
-        step_key = keys[i + 1]  # Use pre-split key
+    # Pre-compute common values
+    sqrt_one_minus_alpha_bar = jnp.sqrt(1.0 - alpha_bar_schedule)
+    sqrt_alpha_bar = jnp.sqrt(alpha_bar_schedule)
+    
+    def single_step(i, carry_state):
+        action, rng_key = carry_state
+        t = num_steps - 1 - i  # Reverse time
         
-        # Predict noise using the network
+        # Predict noise
         predicted_noise = apply_fn(params, observation, t, action)
         
-        # Denoise step (DDPM) - pre-compute values to avoid repeated indexing
-        alpha_t = alpha_schedule[t]
-        alpha_bar_t = alpha_bar_schedule[t]
+        # Denoise
+        action = (action - sqrt_one_minus_alpha_bar[t] * predicted_noise) / sqrt_alpha_bar[t]
+        
+        # Add noise (except last step)
+        rng_key, step_key = jax.random.split(rng_key)
+        noise = jax.random.normal(step_key, action_shape)
+        
+        # Posterior variance for DDPM
         beta_t = beta_schedule[t]
+        alpha_bar_prev = jnp.where(t > 0, alpha_bar_schedule[t-1], 1.0)
+        posterior_var = beta_t * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_schedule[t])
         
-        # Generate noise conditionally
-        noise = jax.random.normal(step_key, action.shape)
-        sigma_t = jnp.sqrt(beta_t)
+        # Only add noise if not the final step
+        noise_scale = jnp.where(t > 0, jnp.sqrt(posterior_var), 0.0)
+        action = action + noise_scale * noise
         
-        # Apply noise only if t > 0 (vectorized conditional)
-        noise_mask = (t > 0).astype(jnp.float32)
-        noise = noise * noise_mask
-        sigma_t = sigma_t * noise_mask
-        
-        # Denoising update
-        action = (1.0 / jnp.sqrt(alpha_t)) * (
-            action - (beta_t / jnp.sqrt(1.0 - alpha_bar_t)) * predicted_noise
-        ) + sigma_t * noise
-        
-        return action
+        return action, rng_key
     
-    action = jax.lax.fori_loop(0, num_diffusion_steps, denoise_step, action)
+    # Use fori_loop but with minimal state
+    final_action, _ = jax.lax.fori_loop(0, num_steps, single_step, (action, key))
     
-    # Apply tanh to bound actions
-    return jnp.tanh(action)
+    return jnp.tanh(final_action)
 
 
 @partial(jax.jit, static_argnums=(3,))
@@ -358,14 +352,17 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
 
     @jax.jit
     def _update_critic(self, batch: ReplayBufferSamples, key: PRNGKeyArray) -> tuple[CriticTrainState, LogDict]:
-        """Update critic networks."""
+        """Update critic networks with memory-efficient implementation."""
         def critic_loss_fn(critic_params):
             # Current Q-values
             q_values = self.critic.apply_fn(
                 critic_params, batch.observations, batch.actions
             )
             
-            # Target Q-values using target parameters - use fewer diffusion steps for target
+            # Target Q-values using target parameters - cache temperature
+            temperature = jax.lax.stop_gradient(self.temperature.apply_fn(self.temperature.params))
+            
+            # Sample next actions once and reuse
             next_actions = diffusion_sample(
                 self.actor.apply_fn, self.actor.params, batch.next_observations, key,
                 self.action_dim, self.beta_schedule, self.alpha_schedule, self.alpha_bar_schedule
@@ -376,11 +373,8 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
             )
             target_q = jnp.min(target_q_values, axis=0)
             
-            # Add entropy bonus - cache temperature computation
-            temperature = self.temperature.apply_fn(self.temperature.params)
+            # Compute targets with entropy bonus
             entropy_bonus = temperature * self.entropy_coefficient
-            
-            # Compute targets
             targets = batch.rewards + self.gamma * (1 - batch.dones) * (
                 target_q + entropy_bonus
             )
@@ -388,7 +382,7 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
             
             # Critic loss - use more stable loss computation
             critic_losses = (q_values - targets[None, :]) ** 2
-            total_loss = jnp.mean(critic_losses)  # Changed from sum to mean for stability
+            total_loss = jnp.mean(critic_losses)
             
             logs = {
                 "train/critic_loss": total_loss,
@@ -402,9 +396,11 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
         (loss, logs), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(
             self.critic.params
         )
+        
+        # Apply gradients
         new_critic = self.critic.apply_gradients(grads=grads)
         
-        # Soft update target parameters
+        # Soft update target parameters with explicit tree_map to avoid memory accumulation
         new_target_params = jax.tree.map(
             lambda target, online: self.tau * online + (1 - self.tau) * target,
             new_critic.target_params,
@@ -496,16 +492,13 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
             new_actor = self.actor
             new_temperature = self.temperature
         
-        return (
-            self.replace(
+        return self.replace(
                 actor=new_actor,
                 critic=new_critic,
                 temperature=new_temperature,
-                key=new_key,  # Update the key
+                key=new_key,
                 _n_updates=self._n_updates + 1,
-            ),
-            logs,
-        )
+            ), logs
 
     @override
     def update(self, batch: ReplayBufferSamples) -> tuple[Self, LogDict]:
