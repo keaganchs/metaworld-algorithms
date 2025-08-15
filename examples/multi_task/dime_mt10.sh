@@ -18,7 +18,7 @@ export PYOPENGL_PLATFORM=egl
 export MUJOCO_GL=egl
 
 python dime_mt10.py \
-    --track True \
+    --track \
     --wandb_project "dime" \
     --wandb_entity "keagan" \
     --wandb_notes "First test of the DIME algorithm on MT10" \

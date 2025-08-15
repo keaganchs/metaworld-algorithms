@@ -18,6 +18,6 @@ export PYOPENGL_PLATFORM=egl
 export MUJOCO_GL=egl
 
 python mtsac_mt10.py \
-    --track True \
+    --track \
     --wandb_project "dime" \
     --wandb_entity "keagan" \
