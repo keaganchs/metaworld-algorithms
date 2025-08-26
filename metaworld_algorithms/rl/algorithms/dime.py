@@ -8,6 +8,7 @@ import distrax
 import flax.linen as nn
 import gymnasium as gym
 import jax
+import jax.flatten_util as flatten_util
 import jax.numpy as jnp
 import numpy as np
 import numpy.typing as npt
@@ -69,33 +70,27 @@ class DiffusionPolicy(nn.Module):
     """Diffusion-based policy network for DIME."""
     
     action_dim: int
+    num_tasks: int
     hidden_dim: int = 256
     num_layers: int = 3
     num_diffusion_steps: int = 16
-    
+
+    # num_task_embedding_observations = num_tasks // 5
+
     @nn.compact
     def __call__(self, observation: Observation, timestep: jnp.ndarray, noisy_action: Action) -> Action:
         """Predict noise to denoise the action."""
         # Get batch dimensions - works for both batched and unbatched inputs
         batch_shape = observation.shape[:-1]
         
-        # Create timestep embedding with proper broadcasting
-        # Use jnp.broadcast_to which is JIT-friendly when target shape is known
-        timestep_embed = jnp.sin(timestep * jnp.array([1.0, 2.0, 4.0, 8.0]))
-        
-        # Always broadcast to match observation batch shape + embedding dim
-        target_embed_shape = batch_shape + (4,)  # 4 is the embedding dimension
-        timestep_embed = jnp.broadcast_to(timestep_embed, target_embed_shape)
-        
-        # Ensure noisy_action has the correct shape by broadcasting
-        target_action_shape = batch_shape + (self.action_dim,)
-        noisy_action = jnp.broadcast_to(noisy_action, target_action_shape)
-        
-        # Concatenate inputs - all shapes are now guaranteed to be compatible
-        inputs = jnp.concatenate([observation, timestep_embed, noisy_action], axis=-1)
-        
+        # Convert timestep to proper shape for broadcasting
+        timestep_array = jnp.full(batch_shape + (1,), timestep, dtype=jnp.float32)
+        # timestep_embed = jnp.sin(timestep_array * jnp.array([1.0, 2.0, 4.0, 8.0]))
+
+        # Concatenate inputs
+        x = jnp.concatenate([observation, noisy_action, timestep_array], axis=-1)
+
         # Forward pass through the network
-        x = inputs
         for _ in range(self.num_layers):
             x = nn.Dense(self.hidden_dim)(x)
             x = nn.gelu(x)
@@ -104,27 +99,16 @@ class DiffusionPolicy(nn.Module):
         noise_prediction = nn.Dense(self.action_dim)(x)
         return noise_prediction
 
-
-# class Temperature(nn.Module):
-#     initial_temperature: float = 1.0
-
-#     def setup(self):
-#         self.log_alpha = self.param(
-#             "log_alpha",
-#             init_fn=lambda key: jnp.full((), jnp.log(self.initial_temperature)),
-#         )
-
-#     def __call__(self) -> Float[Array, ""]:
-#         return jnp.exp(self.log_alpha)
-
-
-@partial(jax.jit, static_argnums=(0, 4))
+# TODO: check implementation
+@partial(jax.jit, static_argnames=["apply_fn", "action_dim"])
 def diffusion_sample(
     apply_fn, params, observation: Observation, key: PRNGKeyArray, 
-    action_dim: int, beta_schedule: jnp.ndarray, alpha_schedule: jnp.ndarray, alpha_bar_schedule: jnp.ndarray
+    action_dim: int, beta_schedule: jnp.ndarray, alpha_schedule: jnp.ndarray, 
+    alpha_bar_schedule: jnp.ndarray
 ) -> Action:
     """Efficient DDPM sampling with minimal overhead."""
     batch_shape = observation.shape[:-1]
+    num_tasks = batch_shape[0] # TODO: might be more efficient to pass as a static arg
     action_shape = batch_shape + (action_dim,)
     num_steps = len(beta_schedule)
     
@@ -141,15 +125,17 @@ def diffusion_sample(
     alpha_bar_prev = jnp.concatenate([jnp.array([1.0]), alpha_bar_schedule[:-1]])
     posterior_var = beta_schedule * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_schedule)
     sqrt_posterior_var = jnp.sqrt(posterior_var)
-    
+
+    # TODO: check if this is actually jittable
+    # @jax.jit
     def single_step(i, carry_state):
         action, rng_key = carry_state
-        t = num_steps - 1 - i  # Reverse time
-        
+        t = (num_steps - 1 - i)  # Reverse time
+
         # Predict noise
         predicted_noise = apply_fn(params, observation, t, action)
         
-        # Denoise using optimized formula
+        # Denoise
         action = (action - sqrt_one_minus_alpha_bar[t] * predicted_noise) / sqrt_alpha_bar[t]
         
         # Add noise (except last step) - optimized conditional
@@ -167,8 +153,8 @@ def diffusion_sample(
     
     return jnp.tanh(final_action)
 
-# OK
-@partial(jax.jit, static_argnums=(3,))
+# TODO: check static args
+@partial(jax.jit, static_argnames=("action_dim"))
 def _sample_action(
     actor: TrainState, observation: Observation, key: PRNGKeyArray,
     action_dim: int, beta_schedule: jnp.ndarray, alpha_schedule: jnp.ndarray, alpha_bar_schedule: jnp.ndarray
@@ -180,8 +166,8 @@ def _sample_action(
     )
     return action, next_key
 
-# OK
-@partial(jax.jit, static_argnums=(3,))
+# TODO: check static args
+@partial(jax.jit, static_argnames=("action_dim"))
 def _eval_action(
     actor: TrainState, observation: Observation, key: PRNGKeyArray,
     action_dim: int, beta_schedule: jnp.ndarray, alpha_schedule: jnp.ndarray, alpha_bar_schedule: jnp.ndarray
@@ -191,21 +177,6 @@ def _eval_action(
         action_dim, beta_schedule, alpha_schedule, alpha_bar_schedule
     )
     return action
-
-
-# TODO impliment
-def extract_task_weights(
-    alpha_params: FrozenDict, task_ids: Float[np.ndarray, "... num_tasks"]
-) -> Float[Array, "... 1"]:
-    log_alpha: jax.Array
-    task_weights: jax.Array
-
-    log_alpha = alpha_params["params"]["log_alpha"]  # pyright: ignore [reportAssignmentType]
-    task_weights = jax.nn.softmax(-log_alpha)
-    task_weights = task_ids @ task_weights.reshape(-1, 1)  # pyright: ignore [reportAssignmentType]
-    task_weights *= log_alpha.shape[0]
-    
-    return task_weights
 
 # OK
 @dataclasses.dataclass(frozen=True)
@@ -242,7 +213,6 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
     num_diffusion_steps: int = struct.field(pytree_node=False)
 
     # Make schedules part of pytree for proper serialization
-    # TODO: confirm
     beta_schedule: Array
     alpha_schedule: Array
     alpha_bar_schedule: Array
@@ -281,13 +251,16 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
         dummy_task_ids = jnp.array(
             [np.ones((config.num_tasks,)) for _ in range(config.num_tasks)]
         )
-
+        dummy_temperature = jnp.array(
+            [np.ones((config.num_tasks,)) for _ in range(config.num_tasks)]
+        )
         dummy_timestep = 0
         action_dim = int(np.prod(env_config.action_space.shape))
 
         # Initialize actor (diffusion policy)
         actor_net = DiffusionPolicy(
             action_dim=action_dim,
+            num_tasks=config.num_tasks,
             hidden_dim=config.diffusion_hidden_dim,
             num_layers=config.diffusion_num_layers,
             num_diffusion_steps=config.num_diffusion_steps,
@@ -319,7 +292,6 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
         target_entropy = -np.prod(env_config.action_space.shape).item()
 
         # Initialize diffusion schedules
-        # TODO: does this need to be task dependent?
         beta_schedule = jnp.linspace(1e-4, 2e-2, config.num_diffusion_steps)
         alpha_schedule = 1.0 - beta_schedule
         alpha_bar_schedule = jnp.cumprod(alpha_schedule)
@@ -371,7 +343,6 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
             ),
         }
 
-    # TODO: action dim shouldn't need to be passed as a function argument
     @override
     def sample_action(self, observation: Observation) -> tuple[Self, Action]:
         action, key = _sample_action(
@@ -380,96 +351,64 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
         )
         return self.replace(key=key), jax.device_get(action)
 
-    # TODO: action dim shouldn't need to be passed as a function argument
     @override
     def eval_action(self, observation: Observation) -> Action:
         return jax.device_get(_eval_action(
             self.actor, observation, self.key, self.action_dim,
             self.beta_schedule, self.alpha_schedule, self.alpha_bar_schedule
         ))
-
-    # From MTSAC
-    def split_data_by_tasks(
-        self,
-        data: PyTree[Float[Array, "batch data_dim"]],
-        task_ids: Float[npt.NDArray, "batch num_tasks"],
-    ) -> PyTree[Float[Array, "num_tasks per_task_batch data_dim"]]:
-        tasks = jnp.argmax(task_ids, axis=1)
-        sorted_indices = jnp.argsort(tasks)
-
-        def group_by_task_leaf(
-            leaf: Float[Array, "batch data_dim"],
-        ) -> Float[Array, "task task_batch data_dim"]:
-            leaf_sorted = leaf[sorted_indices]
-            return leaf_sorted.reshape(self.num_tasks, -1, leaf.shape[1])
-
-        return jax.tree.map(group_by_task_leaf, data), sorted_indices
-
-    # From MTSAC
-    def unsplit_data_by_tasks(
-        self,
-        split_data: PyTree[Float[Array, "num_tasks per_task_batch data_dim"]],
-        sort_indices: jax.Array,
-    ) -> PyTree[Float[Array, "batch data_dim"]]:
-        def reconstruct_leaf(
-            leaf: Float[Array, "num_tasks per_task_batch data_dim"],
-        ) -> Float[Array, "batch data_dim"]:
-            batch_size = leaf.shape[0] * leaf.shape[1]
-            flat = leaf.reshape(batch_size, leaf.shape[-1])
-            # Create inverse permutation
-            inverse_indices = jnp.zeros_like(sort_indices)
-            inverse_indices = inverse_indices.at[sort_indices].set(
-                jnp.arange(batch_size)
-            )
-            return flat[inverse_indices]
-
-        return jax.tree.map(reconstruct_leaf, split_data)
     
     # TODO: up next
     @jax.jit
-    def _update_critic(self, batch: ReplayBufferSamples, key: PRNGKeyArray) -> tuple[CriticTrainState, LogDict]:
+    def _update_critic(self, 
+                       batch: ReplayBufferSamples, 
+                       temperature_value: Float[Array, " batch 1"],
+                       key: PRNGKeyArray) -> tuple[CriticTrainState, LogDict]:
         """Update critic networks with memory-efficient implementation."""
         def critic_loss_fn(critic_params):
             # Current Q-values
             q_values = self.critic.apply_fn(
                 critic_params, batch.observations, batch.actions
             )
-            
-            # Target Q-values using target parameters - cache temperature
-            temperature = jax.lax.stop_gradient(self.temperature.apply_fn(self.temperature.params))
-            
-            # Sample next actions once and reuse
+
+            # Target Q-values
+            # Sample next actions
             next_actions = diffusion_sample(
                 self.actor.apply_fn, self.actor.params, batch.next_observations, key,
                 self.action_dim, self.beta_schedule, self.alpha_schedule, self.alpha_bar_schedule
             )
-            
+            # TODO: add dropout layer?
             target_q_values = self.critic.apply_fn(
                 self.critic.target_params, batch.next_observations, next_actions
             )
             target_q = jnp.min(target_q_values, axis=0)
             
             # Compute targets with entropy bonus
-            entropy_bonus = temperature * self.entropy_coefficient
-            targets = batch.rewards + self.gamma * (1 - batch.dones) * (
-                target_q + entropy_bonus
+            entropy_bonus = temperature_value * self.entropy_coefficient
+            targets = jax.lax.stop_gradient(
+                batch.rewards + self.gamma * (1 - batch.dones) * (target_q + entropy_bonus)
             )
-            targets = jax.lax.stop_gradient(targets)
             
-            # Critic loss - use more stable loss computation
-            critic_losses = (q_values - targets[None, :]) ** 2
+            # Critic loss
+            # TODO: check equivilence to DIME
+            def binary_cross_entropy(prediction, target) -> Float[Array, ""]:
+                return -jnp.mean(target * jnp.log(prediction + 1e-15) + (1 - target) * jnp.log(1 - prediction + 1e-15))
+
+            critic_losses = binary_cross_entropy(q_values, targets[None, :])
             total_loss = jnp.mean(critic_losses)
             
             logs = {
                 "train/critic_loss": total_loss,
                 "train/critic_q_mean": jnp.mean(q_values),
                 "train/critic_target_mean": jnp.mean(targets),
-                "train/temperature": temperature,
+                # "train/temperature": self.temperature,
             }
+            # "train/critic_grad_magnitude": jnp.linalg.norm(flat_grads),
+            # "train/critic_params_norm": jnp.linalg.norm(flat_params_crit),
             
             return total_loss, logs
         
-        (loss, logs), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(
+        (_, logs), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(
             self.critic.params
         )
         
@@ -484,102 +423,62 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
         )
         new_critic = new_critic.replace(target_params=new_target_params)
         
-        return new_critic, logs
+        flat_grads, _ = flatten_util.ravel_pytree(grads)
 
-    # @jax.jit
-    # def _update_critic_with_actions(self, batch: ReplayBufferSamples, key: PRNGKeyArray, next_actions: Action) -> tuple[CriticTrainState, LogDict]:
-    #     """Update critic networks using pre-sampled actions for efficiency."""
-    #     def critic_loss_fn(critic_params):
-    #         # Current Q-values
-    #         q_values = self.critic.apply_fn(
-    #             critic_params, batch.observations, batch.actions
-    #         )
-            
-    #         # Target Q-values using target parameters - cache temperature
-    #         temperature = jax.lax.stop_gradient(self.temperature.apply_fn(self.temperature.params))
-            
-    #         # Use pre-sampled next actions (major optimization)
-    #         target_q_values = self.critic.apply_fn(
-    #             self.critic.target_params, batch.next_observations, next_actions
-    #         )
-    #         target_q = jnp.min(target_q_values, axis=0)
-            
-    #         # Compute targets with entropy bonus
-    #         entropy_bonus = temperature * self.entropy_coefficient
-    #         targets = batch.rewards + self.gamma * (1 - batch.dones) * (
-    #             target_q + entropy_bonus
-    #         )
-    #         targets = jax.lax.stop_gradient(targets)
-            
-    #         # Critic loss - use more stable loss computation
-    #         critic_losses = (q_values - targets[None, :]) ** 2
-    #         total_loss = jnp.mean(critic_losses)
-            
-    #         logs = {
-    #             "train/critic_loss": total_loss,
-    #             "train/critic_q_mean": jnp.mean(q_values),
-    #             "train/critic_target_mean": jnp.mean(targets),
-    #             "train/temperature": temperature,
-    #         }
-            
-    #         return total_loss, logs
-        
-    #     (loss, logs), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(
-    #         self.critic.params
-    #     )
-        
-    #     # Apply gradients
-    #     new_critic = self.critic.apply_gradients(grads=grads)
-        
-    #     # Soft update target parameters with explicit tree_map to avoid memory accumulation
-    #     new_target_params = jax.tree.map(
-    #         lambda target, online: self.tau * online + (1 - self.tau) * target,
-    #         new_critic.target_params,
-    #         new_critic.params,
-    #     )
-    #     new_critic = new_critic.replace(target_params=new_target_params)
-        
-    #     return new_critic, logs
+        return self.replace(critic=new_critic, key=key), {
+            **logs, 
+            "train/critic_grad_magnitude": jnp.linalg.norm(flat_grads),
+        }
+
+    # Alpha
+    @jax.jit
+    def _update_temperature( 
+        self,
+        log_probs: Float[Array, " batch"],
+        task_ids: Float[npt.NDArray, " batch num_tasks"],
+    ) -> tuple[Self, LogDict]:
+        def temperature_loss(params: FrozenDict) -> Float[Array, ""]:
+            log_alpha: jax.Array
+            log_alpha = task_ids @ params["params"]["log_alpha"].reshape(-1, 1)  # pyright: ignore [reportAttributeAccessIssue]
+            return (-log_alpha * (log_probs + self.target_entropy)).mean()
+
+        temperature_loss_value, temperature_grads = jax.value_and_grad(temperature_loss)(
+            self.temperature.params
+        )
+        temperature = self.temperature.apply_gradients(grads=temperature_grads)
+
+        return self.replace(temperature=temperature), {
+            "train/temperature_loss": temperature_loss_value,
+            "train/temperature": jnp.exp(temperature.params["params"]["log_alpha"]).sum(),  # pyright: ignore [reportArgumentType]
+        }
 
     @jax.jit
-    def _update_actor_and_temperature(
-        self, critic: CriticTrainState, batch: ReplayBufferSamples, key: PRNGKeyArray
+    def _update_actor(
+        self, 
+        batch: ReplayBufferSamples, 
+        temperature_values: Float[Array, " batch"],
+        key: PRNGKeyArray,
     ) -> tuple[TrainState, TrainState, LogDict]:
-        """Update actor (diffusion policy) and temperature."""
+        """Update actor (diffusion policy)."""
         def actor_loss_fn(actor_params):
             # Sample actions from diffusion policy
             actions = diffusion_sample(
                 self.actor.apply_fn, actor_params, batch.observations, key,
                 self.action_dim, self.beta_schedule, self.alpha_schedule, self.alpha_bar_schedule
             )
-            
-            # Q-values for these actions
-            q_values = critic.apply_fn(
-                critic.params, batch.observations, actions
+            # Q-values
+            q_values = self.critic.apply_fn(
+                self.critic.params, batch.observations, actions
             )
-            q_value = jnp.min(q_values, axis=0)
-            
-            # Temperature
-            temperature = self.temperature.apply_fn(self.temperature.params)
-            
+            min_q_values = jnp.min(q_values, axis=0)
+
             # Actor loss (maximize Q-value + entropy)
-            actor_loss = -jnp.mean(q_value + temperature * self.entropy_coefficient)
+            actor_loss = -jnp.mean(min_q_values + temperature_values * self.entropy_coefficient)
             
             return actor_loss, {
                 "train/actor_loss": actor_loss,
-                "train/q_value_mean": jnp.mean(q_value),
-            }
-        
-        def temperature_loss_fn(temperature_params):
-            # Temperature loss (entropy regularization)
-            temperature = self.temperature.apply_fn(temperature_params)
-            
-            # Use the target entropy
-            temperature_loss = temperature * (self.entropy_coefficient - self.target_entropy)
-            
-            return jnp.mean(temperature_loss), {
-                # "train/temperature_loss": jnp.mean(temperature_loss),
-                "train/temperature": temperature,
+                "train/q_value_mean": jnp.mean(min_q_values),
+                # "train/actor_params_norm": jnp.linalg.norm(flat_params_act),
             }
         
         # Update actor
@@ -589,83 +488,44 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
         new_actor = self.actor.apply_gradients(grads=actor_grads)
         
         # Update temperature
-        (temp_loss, temp_logs), temp_grads = jax.value_and_grad(
-            temperature_loss_fn, has_aux=True
-        )(self.temperature.params)
-        new_temperature = self.temperature.apply_gradients(grads=temp_grads)
+        (_, temperature_logs) = self._update_temperature(
+            log_probs=temperature_values, task_ids=batch.observations[..., -self.num_tasks:]
+        )
+
+        # flattened_grads = flatten_util.ravel_pytree(actor_grads)
+
+        logs = {**actor_logs,
+                # "train/actor_grad_magnitude": jnp.linalg.norm(flattened_grads),
+                **temperature_logs}
         
-        logs = {**actor_logs, **temp_logs}
-        return new_actor, new_temperature, logs
+        return self.replace(actor=new_actor), logs
 
     @jax.jit
-    def _update_actor_and_temperature_with_actions(
-        self, critic: CriticTrainState, batch: ReplayBufferSamples, key: PRNGKeyArray, actions: Action
-    ) -> tuple[TrainState, TrainState, LogDict]:
-        """Update actor (diffusion policy) and temperature using pre-sampled actions for efficiency."""
-        def actor_loss_fn(actor_params):
-            # Use pre-sampled actions (major optimization - no additional diffusion sampling)
-            
-            # Q-values for these actions
-            q_values = critic.apply_fn(
-                critic.params, batch.observations, actions
-            )
-            q_value = jnp.min(q_values, axis=0)
-            
-            # Temperature
-            temperature = self.temperature.apply_fn(self.temperature.params)
-            
-            # Actor loss (maximize Q-value + entropy)
-            actor_loss = -jnp.mean(q_value + temperature * self.entropy_coefficient)
-            
-            return actor_loss, {
-                "train/actor_loss": actor_loss,
-                "train/q_value_mean": jnp.mean(q_value),
-            }
-        
-        def temperature_loss_fn(temperature_params):
-            # Temperature loss (entropy regularization)
-            temperature = self.temperature.apply_fn(temperature_params)
-            
-            # Use the target entropy
-            temperature_loss = temperature * (self.entropy_coefficient - self.target_entropy)
-            
-            return jnp.mean(temperature_loss), {
-                # "train/temperature_loss": jnp.mean(temperature_loss),
-                "train/temperature": temperature,
-            }
-        
-        # Update actor
-        (actor_loss, actor_logs), actor_grads = jax.value_and_grad(
-            actor_loss_fn, has_aux=True
-        )(self.actor.params)
-        new_actor = self.actor.apply_gradients(grads=actor_grads)
-        
-        # Update temperature
-        (temp_loss, temp_logs), temp_grads = jax.value_and_grad(
-            temperature_loss_fn, has_aux=True
-        )(self.temperature.params)
-        new_temperature = self.temperature.apply_gradients(grads=temp_grads)
-        
-        logs = {**actor_logs, **temp_logs}
-        return new_actor, new_temperature, logs
-
     def _update_inner(self, batch: ReplayBufferSamples) -> tuple[Self, LogDict]:
         """Update the DIME algorithm."""
         # Split keys for proper randomness in each update
         key1, key2, key3, new_key = jax.random.split(self.key, 4)
         
-        # Sample actions once and reuse for both critic and actor updates to save computation
-        # This is the major optimization - avoids redundant diffusion sampling
+        # Get task IDs
+        task_ids = batch.observations[..., -self.num_tasks :]
+
+        # Update temperature
+        temperature_vals = self.temperature.apply_fn(self.temperature.params, task_ids)
+
+        # actor_data = critic_data = batch
+        # actor_alpha_vals = critic_alpha_vals = temperature_vals
+        alpha_val_indices = None
+
+        # Sample actions for critic update
         sampled_actions = diffusion_sample(
             self.actor.apply_fn, self.actor.params, batch.observations, key3,
             self.action_dim, self.beta_schedule, self.alpha_schedule, self.alpha_bar_schedule
         )
         
-        # Update critics with pre-sampled actions #TODO check if caching actions makes sense
-        new_critic, critic_logs = self._update_critic(batch, key1, sampled_actions)
+        _, critic_logs = self._update_critic(batch, temperature_vals, key1)
         
         logs = {}
-        
+
         # Only log critic metrics if we're at a logging step
         should_log = (self._n_updates + 1) % self.logging_frequency == 0
         if should_log:
@@ -673,19 +533,15 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
         
         # Update actor and temperature (with policy delay)
         if (self._n_updates + 1) % self.policy_delay == 0:
-            new_actor, new_temperature, policy_logs = self._update_actor_and_temperature_with_actions(
-                new_critic, batch, key2, sampled_actions
-            )
+            _, policy_logs = self._update_actor(batch, temperature_vals, key2)
             if should_log:
                 logs.update(policy_logs)
-        else:
-            new_actor = self.actor
-            new_temperature = self.temperature
         
         return self.replace(
-                actor=new_actor,
-                critic=new_critic,
-                temperature=new_temperature,
+                # TODO: check if replacing all at once is more efficient
+                # actor=new_actor,
+                # critic=new_critic,
+                # temperature=new_temperature,
                 key=new_key,
                 _n_updates=self._n_updates + 1,
             ), logs
