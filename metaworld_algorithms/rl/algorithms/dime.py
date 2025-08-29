@@ -258,7 +258,10 @@ def _eval_action(
 @dataclasses.dataclass(frozen=True)
 class DIMEConfig(AlgorithmConfig):
     actor_config: ContinuousActionPolicyConfig = ContinuousActionPolicyConfig()
-    critic_config: QValueFunctionConfig = QValueFunctionConfig()
+    critic_config: QValueFunctionConfig = QValueFunctionConfig(
+        use_classification=True,  # Enable distributional Q-learning
+        num_atoms=51             # Number of atoms in the distribution
+    )
     temperature_optimizer_config: OptimizerConfig = OptimizerConfig(max_grad_norm=None)
     initial_temperature: float = 1.0
     num_critics: int = 2
@@ -270,6 +273,11 @@ class DIMEConfig(AlgorithmConfig):
     policy_delay: int = 2
     entropy_coefficient: float = 0.1
     logging_frequency: int = 1000  # How often to log metrics (reduced for performance)
+    
+    # Distributional Q-learning parameters
+    v_min: float = -10.0
+    v_max: float = 10.0
+    num_atoms: int = 51
 
 
 class DIME(OffPolicyAlgorithm[DIMEConfig]):
@@ -287,6 +295,11 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
     target_entropy: float = struct.field(pytree_node=False)
     action_dim: int = struct.field(pytree_node=False)
     num_diffusion_steps: int = struct.field(pytree_node=False)
+
+    # Distributional Q-learning parameters
+    v_min: float = struct.field(pytree_node=False)
+    v_max: float = struct.field(pytree_node=False)
+    num_atoms: int = struct.field(pytree_node=False)
 
     _n_updates: int = struct.field(pytree_node=False)
     logging_frequency: int = struct.field(pytree_node=False)
@@ -378,6 +391,9 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
             target_entropy=target_entropy,
             action_dim=action_dim,
             num_diffusion_steps=config.num_diffusion_steps,
+            v_min=config.v_min,
+            v_max=config.v_max,
+            num_atoms=config.num_atoms,
             _n_updates=0,
             logging_frequency=config.logging_frequency,
         )
@@ -421,47 +437,123 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
             self.actor, observation, self.key, self.action_dim, self.num_diffusion_steps
         ))
     
-    # TODO: up next
     @jax.jit
     def _update_critic(self, 
                        batch: ReplayBufferSamples, 
                        temperature_value: Float[Array, " batch 1"],
                        key: PRNGKeyArray) -> tuple[CriticTrainState, LogDict]:
-        """Update critic networks with memory-efficient implementation."""
+        """Update critic networks with distributional Q-learning."""
+        # Create atom support for distributional Q-learning
+        v_min, v_max, num_atoms = self.v_min, self.v_max, self.num_atoms
+        z_atoms = jnp.linspace(v_min, v_max, num_atoms)
+        
+        def categorical_projection(next_dist, rewards, dones, gamma, v_min, v_max, num_atoms, support):
+            """Project target distribution onto atom support."""
+            delta_z = (v_max - v_min) / (num_atoms - 1)
+            batch_size = rewards.shape[0]
+
+            # Compute target values with entropy bonus
+            entropy_bonus = temperature_value.squeeze(-1) * self.entropy_coefficient
+            target_z = jnp.clip(
+                rewards[:, None] + entropy_bonus[:, None] + (1 - dones[:, None]) * gamma * support,
+                a_min=v_min, a_max=v_max
+            )
+            
+            # Categorical projection
+            b = (target_z - v_min) / delta_z
+            l = jnp.floor(b).astype(jnp.int32)
+            u = jnp.ceil(b).astype(jnp.int32)
+
+            # Adjust boundaries
+            l = jnp.where((u > 0) & (l == u), l - 1, l)
+            u = jnp.where((l < (num_atoms - 1)) & (l == u), u + 1, u)
+
+            # Create projected distribution (initialize with zeros)
+            proj_dist = jnp.zeros((batch_size, num_atoms))
+
+            # Vectorized projection using advanced indexing
+            batch_indices = jnp.arange(batch_size)[:, None]
+            
+            # Project onto lower atoms
+            l_weights = next_dist * (u.astype(jnp.float32) - b)
+            proj_dist = proj_dist.at[batch_indices, l].add(l_weights)
+            
+            # Project onto upper atoms
+            u_weights = next_dist * (b - l.astype(jnp.float32))
+            proj_dist = proj_dist.at[batch_indices, u].add(u_weights)
+
+            return proj_dist
+
         def critic_loss_fn(critic_params):
-            # Current Q-values
-            q_values = self.critic.apply_fn(
+            # Current Q-distributions
+            q_distributions = self.critic.apply_fn(
                 critic_params, batch.observations, batch.actions
             )
 
-            # Target Q-values
-            # Sample next actions using new diffusion sampling
+            # Target Q-distributions
+            # Sample next actions using diffusion sampling
             next_actions, _, _, _ = diffusion_sample(
                 self.actor.params, batch.next_observations, key,
                 self.action_dim, self.num_diffusion_steps
             )
-            # TODO: add dropout layer?
-            target_q_values = self.critic.apply_fn(
+            
+            target_q_distributions = self.critic.apply_fn(
                 self.critic.target_params, batch.next_observations, next_actions
             )
-            target_q = jnp.min(target_q_values, axis=0)
             
-            # Compute targets with entropy bonus
-            entropy_bonus = temperature_value * self.entropy_coefficient
-            targets = jax.lax.stop_gradient(
-                batch.rewards + self.gamma * (1 - batch.dones) * (target_q + entropy_bonus)
+            num_critics = len(target_q_distributions)
+            
+            # Project target distributions for all critics
+            target_projections = []
+            for i in range(num_critics):
+                target_proj = categorical_projection(
+                    target_q_distributions[i], batch.rewards, batch.dones, self.gamma,
+                    v_min, v_max, num_atoms, z_atoms
+                )
+                target_projections.append(target_proj)
+            
+            # Average the projected targets across all critics
+            target_dist = jax.lax.stop_gradient(
+                jnp.mean(jnp.stack(target_projections, axis=0), axis=0)
             )
             
-            # Critic loss - using MSE instead of binary cross entropy for Q-learning
-            # TODO: implement with Distributional QL
-            critic_losses = jnp.mean((q_values - targets[None, :]) ** 2, axis=1)
-            total_loss = jnp.mean(critic_losses)
+            # Cross-entropy loss for distributional Q-learning
+            def cross_entropy_loss(pred_dist, target_dist):
+                return -jnp.mean(jnp.sum(target_dist * jnp.log(pred_dist + 1e-15), axis=-1))
             
+            # Compute losses for all critics
+            critic_losses = []
+            q_values_list = []
+            entropy_list = []
+            
+            for i in range(num_critics):
+                current_q_dist = q_distributions[i]
+                loss = cross_entropy_loss(current_q_dist, target_dist)
+                critic_losses.append(loss)
+                
+                # Compute Q-values from distribution for logging
+                q_values = jnp.sum(current_q_dist * z_atoms, axis=-1)
+                q_values_list.append(q_values)
+                
+                # Compute entropy for logging
+                entropy = -jnp.mean(jnp.sum(current_q_dist * jnp.log(current_q_dist + 1e-15), axis=-1))
+                entropy_list.append(entropy)
+            
+            total_loss = jnp.sum(jnp.stack(critic_losses))
+            
+            # Take minimum Q-values across all critics for conservative estimate
+            min_q_values = jnp.min(jnp.stack(q_values_list, axis=0), axis=0)
+            
+            # Build logs dictionary
             logs = {
                 "losses/critic_loss": total_loss,
-                "losses/critic_q_values": jnp.mean(q_values),
-                "losses/critic_targets": jnp.mean(targets),
+                "losses/critic_q_values": jnp.mean(min_q_values),
             }
+            
+            # Add individual critic logs
+            for i in range(num_critics):
+                logs[f"losses/critic_q{i+1}_loss"] = critic_losses[i]
+                logs[f"metrics/critic_entropy_q{i+1}"] = entropy_list[i]
             
             return total_loss, logs
         
@@ -518,7 +610,11 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
         temperature_values: Float[Array, " batch"],
         key: PRNGKeyArray,
     ) -> tuple[Self, LogDict]:
-        """Update actor (diffusion policy)."""
+        """Update actor (diffusion policy) with distributional Q-values."""
+        # Distributional Q parameters (same as in critic)
+        v_min, v_max, num_atoms = self.v_min, self.v_max, self.num_atoms
+        z_atoms = jnp.linspace(v_min, v_max, num_atoms)
+        
         def actor_loss_fn(actor_params):
             # Sample actions from diffusion policy with entropy costs
             actions, running_costs, stochastic_costs, terminal_costs = diffusion_sample(
@@ -526,11 +622,21 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
                 self.action_dim, self.num_diffusion_steps
             )
             
-            # Q-values
-            q_values = self.critic.apply_fn(
+            # Q-distributions
+            q_distributions = self.critic.apply_fn(
                 self.critic.params, batch.observations, actions
             )
-            min_q_values = jnp.min(q_values, axis=0)
+            
+            num_critics = len(q_distributions)
+            
+            # Convert distributions to Q-values for all critics
+            q_values_list = []
+            for i in range(num_critics):
+                q_values = jnp.sum(q_distributions[i] * z_atoms, axis=-1)
+                q_values_list.append(q_values)
+            
+            # Take minimum across all critics for conservative estimate
+            min_q_values = jnp.min(jnp.stack(q_values_list, axis=0), axis=0)
 
             # DIME-style actor loss with entropy costs
             total_entropy_costs = running_costs + stochastic_costs + terminal_costs
