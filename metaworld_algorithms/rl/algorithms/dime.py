@@ -254,19 +254,33 @@ def _eval_action(
     )
     return action
 
+
+def extract_task_weights(
+    alpha_params: FrozenDict, task_ids: Float[np.ndarray, "... num_tasks"]
+) -> Float[Array, "... 1"]:
+    log_alpha: jax.Array
+    task_weights: jax.Array
+
+    log_alpha = alpha_params["params"]["log_alpha"]  # pyright: ignore [reportAssignmentType]
+    task_weights = jax.nn.softmax(-log_alpha)
+    task_weights = task_ids @ task_weights.reshape(-1, 1)  # pyright: ignore [reportAssignmentType]
+    task_weights *= log_alpha.shape[0]
+    return task_weights
+
+
 # OK
 @dataclasses.dataclass(frozen=True)
 class DIMEConfig(AlgorithmConfig):
     actor_config: ContinuousActionPolicyConfig = ContinuousActionPolicyConfig()
     critic_config: QValueFunctionConfig = QValueFunctionConfig(
         use_classification=True,  # Enable distributional Q-learning
-        num_atoms=51             # Number of atoms in the distribution
     )
     temperature_optimizer_config: OptimizerConfig = OptimizerConfig(max_grad_norm=None)
     initial_temperature: float = 1.0
     num_critics: int = 2
     tau: float = 0.005
     policy_tau: float = 0.005 # TODO
+    use_task_weights: bool = False
     num_diffusion_steps: int = 16
     diffusion_hidden_dim: int = 256
     diffusion_num_layers: int = 3
@@ -301,6 +315,11 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
     v_max: float = struct.field(pytree_node=False)
     num_atoms: int = struct.field(pytree_node=False)
 
+    # Training configuration
+    use_task_weights: bool = struct.field(pytree_node=False)
+    split_actor_losses: bool = struct.field(pytree_node=False)
+    split_critic_losses: bool = struct.field(pytree_node=False)
+    
     _n_updates: int = struct.field(pytree_node=False)
     logging_frequency: int = struct.field(pytree_node=False)
 
@@ -394,6 +413,9 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
             v_min=config.v_min,
             v_max=config.v_max,
             num_atoms=config.num_atoms,
+            use_task_weights=config.use_task_weights,
+            split_actor_losses=config.actor_config.network_config.optimizer.requires_split_task_losses,
+            split_critic_losses=config.critic_config.network_config.optimizer.requires_split_task_losses,
             _n_updates=0,
             logging_frequency=config.logging_frequency,
         )
@@ -424,6 +446,41 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
             ),
         }
 
+    def split_data_by_tasks(
+        self,
+        data: PyTree[Float[Array, "batch data_dim"]],
+        task_ids: Float[npt.NDArray, "batch num_tasks"],
+    ) -> PyTree[Float[Array, "num_tasks per_task_batch data_dim"]]:
+        tasks = jnp.argmax(task_ids, axis=1)
+        sorted_indices = jnp.argsort(tasks)
+
+        def group_by_task_leaf(
+            leaf: Float[Array, "batch data_dim"],
+        ) -> Float[Array, "task task_batch data_dim"]:
+            leaf_sorted = leaf[sorted_indices]
+            return leaf_sorted.reshape(self.num_tasks, -1, leaf.shape[1])
+
+        return jax.tree.map(group_by_task_leaf, data), sorted_indices
+
+    def unsplit_data_by_tasks(
+        self,
+        split_data: PyTree[Float[Array, "num_tasks per_task_batch data_dim"]],
+        sort_indices: jax.Array,
+    ) -> PyTree[Float[Array, "batch data_dim"]]:
+        def reconstruct_leaf(
+            leaf: Float[Array, "num_tasks per_task_batch data_dim"],
+        ) -> Float[Array, "batch data_dim"]:
+            batch_size = leaf.shape[0] * leaf.shape[1]
+            flat = leaf.reshape(batch_size, leaf.shape[-1])
+            # Create inverse permutation
+            inverse_indices = jnp.zeros_like(sort_indices)
+            inverse_indices = inverse_indices.at[sort_indices].set(
+                jnp.arange(batch_size)
+            )
+            return flat[inverse_indices]
+
+        return jax.tree.map(reconstruct_leaf, split_data)
+
     @override
     def sample_action(self, observation: Observation) -> tuple[Self, Action]:
         action, running_costs, stochastic_costs, terminal_costs, key = _sample_action(
@@ -437,12 +494,15 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
             self.actor, observation, self.key, self.action_dim, self.num_diffusion_steps
         ))
     
-    @jax.jit
-    def _update_critic(self, 
-                       batch: ReplayBufferSamples, 
-                       temperature_value: Float[Array, " batch 1"],
-                       key: PRNGKeyArray) -> tuple[CriticTrainState, LogDict]:
+    def update_critic(
+        self,
+        data: ReplayBufferSamples,
+        temperature_val: Float[Array, "*batch 1"],
+        task_weights: Float[Array, "*batch 1"] | None = None,
+    ) -> tuple[Self, LogDict]:
         """Update critic networks with distributional Q-learning."""
+        key, critic_loss_key = jax.random.split(self.key)
+        
         # Create atom support for distributional Q-learning
         v_min, v_max, num_atoms = self.v_min, self.v_max, self.num_atoms
         z_atoms = jnp.linspace(v_min, v_max, num_atoms)
@@ -451,54 +511,58 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
             """Project target distribution onto atom support."""
             delta_z = (v_max - v_min) / (num_atoms - 1)
             batch_size = rewards.shape[0]
-
-            # Compute target values with entropy bonus
-            entropy_bonus = temperature_value.squeeze(-1) * self.entropy_coefficient
+            
+            # Expand support for batch processing
+            support = jnp.expand_dims(support, 0)  # [1, num_atoms]
+            
             target_z = jnp.clip(
-                rewards[:, None] + entropy_bonus[:, None] + (1 - dones[:, None]) * gamma * support,
+                rewards[:, None] + (1 - dones[:, None]) * gamma * support,
                 a_min=v_min, a_max=v_max
             )
             
-            # Categorical projection
+            # Compute indices for distribution projection
             b = (target_z - v_min) / delta_z
             l = jnp.floor(b).astype(jnp.int32)
             u = jnp.ceil(b).astype(jnp.int32)
-
-            # Adjust boundaries
-            l = jnp.where((u > 0) & (l == u), l - 1, l)
+            
+            # Handle edge cases where l == u  
             u = jnp.where((l < (num_atoms - 1)) & (l == u), u + 1, u)
-
-            # Create projected distribution (initialize with zeros)
+            
+            # Initialize projection distribution
             proj_dist = jnp.zeros((batch_size, num_atoms))
-
-            # Vectorized projection using advanced indexing
-            batch_indices = jnp.arange(batch_size)[:, None]
             
-            # Project onto lower atoms
+            # Compute projection weights for lower indices
+            l_mask = (l >= 0) & (l < num_atoms)
             l_weights = next_dist * (u.astype(jnp.float32) - b)
-            proj_dist = proj_dist.at[batch_indices, l].add(l_weights)
             
-            # Project onto upper atoms
+            # Compute projection weights for upper indices  
+            u_mask = (u >= 0) & (u < num_atoms) 
             u_weights = next_dist * (b - l.astype(jnp.float32))
-            proj_dist = proj_dist.at[batch_indices, u].add(u_weights)
-
+            
+            # Add weights to projection distribution
+            proj_dist = proj_dist.at[jnp.arange(batch_size)[:, None], l].add(
+                jnp.where(l_mask, l_weights, 0.0)
+            )
+            proj_dist = proj_dist.at[jnp.arange(batch_size)[:, None], u].add(
+                jnp.where(u_mask, u_weights, 0.0)
+            )
+            
             return proj_dist
 
         def critic_loss_fn(critic_params):
             # Current Q-distributions
             q_distributions = self.critic.apply_fn(
-                critic_params, batch.observations, batch.actions
+                critic_params, data.observations, data.actions
             )
-
-            # Target Q-distributions
+            
             # Sample next actions using diffusion sampling
             next_actions, _, _, _ = diffusion_sample(
-                self.actor.params, batch.next_observations, key,
+                self.actor.params, data.next_observations, critic_loss_key,
                 self.action_dim, self.num_diffusion_steps
             )
             
             target_q_distributions = self.critic.apply_fn(
-                self.critic.target_params, batch.next_observations, next_actions
+                self.critic.target_params, data.next_observations, next_actions
             )
             
             num_critics = len(target_q_distributions)
@@ -507,7 +571,7 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
             target_projections = []
             for i in range(num_critics):
                 target_proj = categorical_projection(
-                    target_q_distributions[i], batch.rewards, batch.dones, self.gamma,
+                    target_q_distributions[i], data.rewards, data.dones, self.gamma,
                     v_min, v_max, num_atoms, z_atoms
                 )
                 target_projections.append(target_proj)
@@ -579,11 +643,9 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
             **logs, 
             "metrics/critic_grad_magnitude": jnp.linalg.norm(flat_grads),
             "metrics/critic_params_norm": jnp.linalg.norm(flat_params_crit),
-        }
-
-    # Alpha
+        }    # Alpha
     @jax.jit
-    def _update_temperature( 
+    def update_temperature( 
         self,
         log_probs: Float[Array, " batch"],
         task_ids: Float[npt.NDArray, " batch num_tasks"],
@@ -603,14 +665,15 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
             "temperature": jnp.exp(temperature.params["params"]["log_alpha"]).sum(),  # pyright: ignore [reportArgumentType]
         }
 
-    @jax.jit
-    def _update_actor(
-        self, 
-        batch: ReplayBufferSamples, 
-        temperature_values: Float[Array, " batch"],
-        key: PRNGKeyArray,
-    ) -> tuple[Self, LogDict]:
+    def update_actor(
+        self,
+        data: ReplayBufferSamples,
+        temperature_val: Float[Array, "batch 1"],
+        task_weights: Float[Array, "batch 1"] | None = None,
+    ) -> tuple[Self, Float[Array, " batch"], LogDict]:
         """Update actor (diffusion policy) with distributional Q-values."""
+        key, actor_loss_key = jax.random.split(self.key)
+        
         # Distributional Q parameters (same as in critic)
         v_min, v_max, num_atoms = self.v_min, self.v_max, self.num_atoms
         z_atoms = jnp.linspace(v_min, v_max, num_atoms)
@@ -618,13 +681,13 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
         def actor_loss_fn(actor_params):
             # Sample actions from diffusion policy with entropy costs
             actions, running_costs, stochastic_costs, terminal_costs = diffusion_sample(
-                actor_params, batch.observations, key,
+                actor_params, data.observations, actor_loss_key,
                 self.action_dim, self.num_diffusion_steps
             )
             
             # Q-distributions
             q_distributions = self.critic.apply_fn(
-                self.critic.params, batch.observations, actions
+                self.critic.params, data.observations, actions
             )
             
             num_critics = len(q_distributions)
@@ -640,89 +703,85 @@ class DIME(OffPolicyAlgorithm[DIMEConfig]):
 
             # DIME-style actor loss with entropy costs
             total_entropy_costs = running_costs + stochastic_costs + terminal_costs
-            actor_loss = jnp.mean(-min_q_values + temperature_values.squeeze() * total_entropy_costs)
+            if task_weights is not None:
+                actor_loss = (task_weights.squeeze() * (-min_q_values + temperature_val.squeeze() * total_entropy_costs)).mean()
+            else:
+                actor_loss = (-min_q_values + temperature_val.squeeze() * total_entropy_costs).mean()
             
-            return actor_loss, {
-                "running_costs": jnp.mean(running_costs),
-                "stochastic_costs": jnp.mean(stochastic_costs),
-                "terminal_costs": jnp.mean(terminal_costs),
-                "total_entropy_costs": jnp.mean(total_entropy_costs),
-                "q_values": jnp.mean(min_q_values),
-            }
+            return actor_loss, total_entropy_costs
         
         # Update actor
-        (actor_loss_value, aux_data), actor_grads = jax.value_and_grad(
+        (actor_loss_value, log_probs), actor_grads = jax.value_and_grad(
             actor_loss_fn, has_aux=True
         )(self.actor.params)
+        
         new_actor = self.actor.apply_gradients(grads=actor_grads)
         
         # Compute gradient and parameter norms for logging (similar to MTSAC)
         flat_grads, _ = flatten_util.ravel_pytree(actor_grads)
         flat_params_act, _ = flatten_util.ravel_pytree(new_actor.params)
         
-        # Update temperature using entropy costs as log probabilities
-        total_entropy_costs = aux_data["total_entropy_costs"]
-        task_ids = batch.observations[..., -self.num_tasks:]
-        new_self, temperature_logs = self._update_temperature(
-            log_probs=total_entropy_costs, task_ids=task_ids
-        )
-
-        # Compile all logs with proper naming convention
-        actor_logs = {
+        logs = {
             "losses/actor_loss": actor_loss_value,
-            "losses/running_costs": aux_data["running_costs"],
-            "losses/stochastic_costs": aux_data["stochastic_costs"],
-            "losses/terminal_costs": aux_data["terminal_costs"],
-            "losses/total_entropy_costs": aux_data["total_entropy_costs"],
-            "losses/actor_q_values": aux_data["q_values"],
             "metrics/actor_grad_magnitude": jnp.linalg.norm(flat_grads),
             "metrics/actor_params_norm": jnp.linalg.norm(flat_params_act),
         }
         
-        logs = {**actor_logs, **temperature_logs}
-        
-        return new_self.replace(actor=new_actor), logs
+        return self.replace(actor=new_actor, key=key), log_probs, logs
 
     @jax.jit
-    def _update_inner(self, batch: ReplayBufferSamples) -> tuple[Self, LogDict]:
-        """Update the DIME algorithm."""
-        # Split keys for proper randomness in each update
-        key1, key2, key3, new_key = jax.random.split(self.key, 4)
-        
-        # Get task IDs
-        task_ids = batch.observations[..., -self.num_tasks :]
+    def _update_inner(self, data: ReplayBufferSamples) -> tuple[Self, LogDict]:
+        """Update the DIME algorithm following MTSAC structure."""
+        task_ids = data.observations[..., -self.num_tasks :]
 
-        # Update temperature
         temperature_vals = self.temperature.apply_fn(self.temperature.params, task_ids)
+        if self.use_task_weights:
+            task_weights = extract_task_weights(self.temperature.params, task_ids)
+        else:
+            task_weights = None
 
-        # actor_data = critic_data = batch
-        # actor_alpha_vals = critic_alpha_vals = temperature_vals
-        # alpha_val_indices = None
+        actor_data = critic_data = data
+        actor_temperature_vals = critic_temperature_vals = temperature_vals
+        actor_task_weights = critic_task_weights = task_weights
+        temperature_val_indices = None
 
-        # Update critic
-        _, critic_logs = self._update_critic(batch, temperature_vals, key1)
-        
-        logs = {}
+        if self.split_critic_losses or self.split_actor_losses:
+            split_data, _ = self.split_data_by_tasks(data, task_ids)
+            split_temperature_vals, temperature_val_indices = self.split_data_by_tasks(
+                temperature_vals, task_ids
+            )
+            split_task_weights, _ = (
+                self.split_data_by_tasks(task_weights, task_ids)
+                if task_weights is not None
+                else (None, None)
+            )
 
-        # Only log critic metrics if we're at a logging step
-        should_log = (self._n_updates + 1) % self.logging_frequency == 0
-        if should_log:
-            logs.update(critic_logs)
-        
-        # Update actor and temperature (with policy delay)
-        if (self._n_updates + 1) % self.policy_delay == 0:
-            _, policy_logs = self._update_actor(batch, temperature_vals, key2)
-            if should_log:
-                logs.update(policy_logs)
-        
-        return self.replace(
-                # TODO: check if replacing all at once is more efficient
-                # actor=new_actor,
-                # critic=new_critic,
-                # temperature=new_temperature,
-                key=new_key,
-                _n_updates=self._n_updates + 1,
-            ), logs
+            if self.split_critic_losses:
+                critic_data = split_data
+                critic_temperature_vals = split_temperature_vals
+                critic_task_weights = split_task_weights
+
+            if self.split_actor_losses:
+                actor_data = split_data
+                actor_temperature_vals = split_temperature_vals
+                actor_task_weights = split_task_weights
+
+        self, critic_logs = self.update_critic(
+            critic_data, critic_temperature_vals, critic_task_weights
+        )
+        self, log_probs, actor_logs = self.update_actor(
+            actor_data, actor_temperature_vals, actor_task_weights
+        )
+        if self.split_actor_losses:
+            assert temperature_val_indices is not None
+            log_probs = self.unsplit_data_by_tasks(log_probs, temperature_val_indices)
+        self, temperature_logs = self.update_temperature(log_probs, task_ids)
+
+        return self, {
+            **critic_logs,
+            **actor_logs,
+            **temperature_logs,
+        }
 
     @override
     def update(self, batch: ReplayBufferSamples) -> tuple[Self, LogDict]:
